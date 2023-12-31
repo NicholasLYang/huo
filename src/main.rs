@@ -1,40 +1,11 @@
-// Ideas for syntax:
-// zeros: [2 x 3; 0]
-// ones:  [2 x 3; 1]
-// arange: [0..10]
-// arange w/step: [0..10; 2]
-// range: [0..=10]
-//
-// a = [2 x 3; 0]
-// b = [3 x 4; 1]
-// c = a * b
+mod ast;
+mod parser;
+mod type_checker;
 
+use ast::{BinaryOp, Expr, Stmt};
 use candle_core::DType;
-use quote::quote;
-
-enum Expr {
-    Tensor {
-        fill: i32,
-        shape: Vec<usize>,
-        data_type: Option<DType>
-    },
-    RangeTensor {
-        start: i32,
-        stop: i32,
-        step: Option<i32>,
-    },
-    Binary {
-        lhs: Box<Expr>,
-        rhs: Box<Expr>,
-        op: BinaryOp,
-    },
-}
-
-enum BinaryOp {
-    Add,
-    Sub,
-    Mul,
-}
+use itertools::Itertools;
+use quote::{format_ident, quote};
 
 #[derive(Debug, Default)]
 struct Compiler {
@@ -54,9 +25,28 @@ impl Compiler {
         }
     }
 
+    fn compile_stmt(&mut self, stmt: Stmt) {
+        match stmt {
+            Stmt::Expr(expr) => {
+                self.compile_expr(expr);
+                self.output.push(quote! { ; });
+            }
+            Stmt::Assign { lhs, rhs } => {
+                let lhs = format_ident!("{}", lhs);
+                self.output.push(quote! { let #lhs = });
+                self.compile_expr(rhs);
+                self.output.push(quote! { ; });
+            }
+        }
+    }
+
     fn compile_expr(&mut self, expr: Expr) {
         match expr {
-            Expr::Tensor { fill, shape, data_type } => {
+            Expr::FillTensor {
+                fill,
+                shape,
+                data_type,
+            } => {
                 let data_type = Self::compile_data_type(data_type.unwrap_or(DType::F32));
                 self.output.push(match fill {
                     0 => quote! { Tensor::zeros((#(#shape),*), #data_type, &Device::Cpu) },
@@ -64,22 +54,42 @@ impl Compiler {
                     _ => quote! { Tensor::full((#(#shape),*), #fill, #data_type, &Device::Cpu) },
                 })
             }
-            Expr::RangeTensor { .. } => {
-                todo!()
-            }
-            Expr::Binary { .. } => {
-                todo!()
+            Expr::RangeTensor {
+                start,
+                stop,
+                step: Some(step),
+            } => self.output.push(quote! {
+                Tensor::arange_step(#start, #stop, #step, DType::I64, &Device::Cpu)
+            }),
+            Expr::RangeTensor {
+                start,
+                stop,
+                step: None,
+            } => self.output.push(quote! {
+                Tensor::arange(#start, #stop, DType::I64, &Device::Cpu)
+            }),
+            Expr::Binary { lhs, rhs, op } => {
+                self.compile_expr(*lhs);
+                match op {
+                    BinaryOp::Add => self.output.push(quote! { + }),
+                    BinaryOp::Sub => self.output.push(quote! { - }),
+                    BinaryOp::Mul => self.output.push(quote! { * }),
+                }
+                self.compile_expr(*rhs);
             }
         }
     }
 
     fn print(&self) -> Result<(), anyhow::Error> {
-        for stream in &self.output {
-            let stream_str = format!("fn main() {{ {} }}", stream.to_string());
-            let parsed_file = syn::parse_file(stream_str.as_str())?;
-            let pretty_output = prettyplease::unparse(&parsed_file);
-            println!("{}", pretty_output);
-        }
+        let streams = self
+            .output
+            .iter()
+            .map(|stream| stream.to_string())
+            .join(" ");
+        let stream_str = format!("fn main() {{ {} }}", streams.to_string());
+        let parsed_file = syn::parse_file(stream_str.as_str())?;
+        let pretty_output = prettyplease::unparse(&parsed_file);
+        println!("{}", pretty_output);
 
         Ok(())
     }
@@ -87,10 +97,21 @@ impl Compiler {
 
 fn main() -> Result<(), anyhow::Error> {
     let mut compiler = Compiler::default();
-    compiler.compile_expr(Expr::Tensor {
-        fill: 0,
-        shape: vec![2, 3],
-        data_type: None,
+    compiler.compile_stmt(Stmt::Assign {
+        lhs: "tensor".to_string(),
+        rhs: Expr::Binary {
+            rhs: Box::new(Expr::FillTensor {
+                fill: 0,
+                shape: vec![2, 3],
+                data_type: None,
+            }),
+            lhs: Box::new(Expr::RangeTensor {
+                start: 0,
+                stop: 10,
+                step: None,
+            }),
+            op: BinaryOp::Mul,
+        },
     });
     compiler.print()?;
 
