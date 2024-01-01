@@ -1,16 +1,15 @@
-use crate::ast::{Expr, Program, Stmt};
-use candle_core::DType;
+use crate::ast::{BinaryOp, Expr, Loc, Program, Stmt};
 use chumsky::prelude::*;
 use itertools::Itertools;
 
-fn parse(program: &str) -> Result<Program, anyhow::Error> {
+pub fn parse(code: &str) -> Result<Loc<Program>, anyhow::Error> {
     parser()
-        .parse(program)
+        .parse(code)
         .map_err(|e| anyhow::anyhow!("failed to parse: {}", e.into_iter().join("\n")))
 }
 
-fn parser() -> impl Parser<char, Program, Error = Simple<char>> {
-    let uint = text::int(10);
+fn parser() -> impl Parser<char, Loc<Program>, Error = Simple<char>> {
+    let uint = text::int(10).map_with_span(Loc);
     let range_tensor = just('[')
         .padded()
         .ignore_then(uint.clone())
@@ -25,9 +24,9 @@ fn parser() -> impl Parser<char, Program, Error = Simple<char>> {
         )
         .then_ignore(just(']').padded())
         .map(|((start, stop), step)| Expr::RangeTensor {
-            start: start.parse().unwrap(),
-            stop: stop.parse().unwrap(),
-            step: step.map(|s| s.parse().unwrap()),
+            start: start.map(|start| start.parse::<i32>().unwrap()),
+            stop: stop.map(|start| start.parse::<i32>().unwrap()),
+            step: step.map(|s| s.map(|s| s.parse::<i32>().unwrap())),
         });
 
     let fill_tensor = just('[')
@@ -37,26 +36,53 @@ fn parser() -> impl Parser<char, Program, Error = Simple<char>> {
         .then(uint.clone())
         .then_ignore(just(']').padded())
         .map(|(shape, fill)| Expr::FillTensor {
-            fill: fill.parse().unwrap(),
-            shape: shape.into_iter().map(|s| s.parse().unwrap()).collect(),
+            fill: fill.map(|fill| fill.parse().unwrap()),
+            shape: shape
+                .into_iter()
+                .map(|s| s.map(|s| s.parse::<usize>().unwrap()))
+                .collect(),
             // TODO: Support other data types
-            data_type: Some(DType::U32),
+            data_type: None,
         });
 
-    let expr = fill_tensor.or(range_tensor);
+    let var = text::ident().map(Expr::Variable);
+
+    let atom = fill_tensor.or(range_tensor).or(var).map_with_span(Loc);
+
+    let expr = atom
+        .clone()
+        .then(
+            just('*')
+                .padded()
+                .map_with_span(|_, span| Loc(BinaryOp::Mul, span))
+                .then(atom)
+                .repeated(),
+        )
+        .foldl(|lhs, (op, rhs)| {
+            let span = (lhs.1.start())..(rhs.1.end());
+            Loc(
+                Expr::Binary {
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                    op,
+                },
+                span,
+            )
+        });
 
     let expr_stmt = expr.clone().then_ignore(just(';').padded()).map(Stmt::Expr);
 
     let assign_stmt = text::ident()
+        .map_with_span(Loc)
         .then_ignore(just('=').padded())
         .then(expr)
         .then_ignore(just(';').padded())
         .map(|(lhs, rhs)| Stmt::Assign { lhs, rhs });
 
-    let stmt = expr_stmt.or(assign_stmt);
+    let stmt = expr_stmt.or(assign_stmt).map_with_span(Loc);
 
     stmt.repeated()
-        .map(|stmts| Program { stmts })
+        .map_with_span(|stmts, span| Loc(Program { stmts }, span))
         .then_ignore(end())
 }
 
